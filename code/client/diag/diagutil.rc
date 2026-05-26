@@ -36,22 +36,13 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-<<<<<<< ours
             VALUE "CompanyName", "cfx-collective"
-=======
-            VALUE "CompanyName", "Alfa MP"
->>>>>>> theirs
 			VALUE "FileDescription", "Alfa MP Diagnostics Utility"
             VALUE "FileVersion", "1.1.0.0"
             VALUE "InternalName", "Citizen"
             VALUE "LegalCopyright", "(C) 2026 Alfa MP"
-<<<<<<< ours
             VALUE "OriginalFilename", "citizenmp.exe"
             VALUE "ProductName", "Citizen"
-=======
-            VALUE "OriginalFilename", "alfamp-diag.exe"
-            VALUE "ProductName", "Alfa MP"
->>>>>>> theirs
             VALUE "ProductVersion", "1.0.0.0"
         END
     END
