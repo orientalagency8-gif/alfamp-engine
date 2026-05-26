@@ -1,0 +1,150 @@
+name: Build Alfa MP Engine (Windows)
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GIT_LFS_SKIP_SMUDGE: "1"
+  PROGRAM: five
+  ROOT: C:\b
+  REPO: C:\b\alfamp-engine
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout our engine
+        uses: actions/checkout@v4
+        with:
+          path: src
+          lfs: false
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install setuptools
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - run: npm install -g yarn
+
+      - name: Configure MSYS2
+        shell: pwsh
+        run: |
+          $msys = "C:\msys64"
+          "$msys\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$msys\usr\bin\pacman.exe" -S --noconfirm --needed make diffutils curl
+
+      - uses: microsoft/setup-msbuild@v2
+        with: { msbuild-architecture: x64 }
+
+      - name: Move source to C:\b
+        shell: bash
+        run: |
+          mkdir -p /c/b
+          mv src /c/b/alfamp-engine
+
+      - name: Cache build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\b\alfamp-engine\code\build
+            C:\b\alfamp-engine\vendor
+          key: alfamp-engine-${{ github.sha }}
+          restore-keys: |
+            alfamp-engine-
+
+      - name: Fetch LFS via media URL (from upstream — same blobs)
+        shell: bash
+        run: |
+          set -e
+          cd /c/b/alfamp-engine
+          mapfile -t FILES < <(git lfs ls-files -n 2>/dev/null || true)
+          echo "::notice::Found ${#FILES[@]} LFS files"
+          export OWNER=citizenfx OWNER_NAME=fivem REF=master
+          printf '%s\n' "${FILES[@]}" | xargs -P 8 -I {} bash -c '
+            path="{}"
+            url="https://media.githubusercontent.com/media/${OWNER}/${OWNER_NAME}/${REF}/${path}"
+            tmp="${path}.tmp.$$"
+            if curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$tmp"; then
+              mv "$tmp" "$path"
+            else
+              rm -f "$tmp"
+              echo "::warning::failed to fetch $path"
+            fi
+          '
+          STILL=0
+          for p in "${FILES[@]}"; do
+            if [ -f "$p" ]; then
+              sz=$(wc -c <"$p")
+              if [ "$sz" -le 250 ] && head -c 50 "$p" | grep -q "git-lfs.github.com"; then
+                STILL=$((STILL+1))
+              fi
+            fi
+          done
+          if [ "$STILL" -gt 0 ]; then
+            echo "::error::$STILL LFS files still pointers — fatal"
+            exit 1
+          fi
+          du -sh .
+
+      - name: Strip svadhesive reference
+        shell: bash
+        working-directory: ${{ env.REPO }}
+        run: |
+          if grep -rl "svadhesive" code/components.json 2>/dev/null; then
+            python3 -c "import json; p='code/components.json'; d=json.load(open(p)); d=[c for c in d if 'svadhesive' not in str(c).lower()]; json.dump(d,open(p,'w'),indent=2)"
+            echo "stripped svadhesive"
+          fi
+
+      - name: Download Chrome / CEF
+        shell: pwsh
+        working-directory: ${{ env.REPO }}
+        run: pwsh ./fxd.ps1 get-chrome
+
+      - name: Prebuild
+        shell: cmd
+        working-directory: ${{ env.REPO }}
+        run: prebuild.cmd
+
+      - name: Generate solution
+        shell: pwsh
+        working-directory: ${{ env.REPO }}
+        run: pwsh ./fxd.ps1 gen -game ${{ env.PROGRAM }}
+
+      - name: Patch Windows SDK target
+        shell: pwsh
+        working-directory: ${{ env.REPO }}\code\build\${{ env.PROGRAM }}
+        run: |
+          $sdks = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include\" | Where-Object { $_.Name -match '^10\.0\.' } | Sort-Object Name -Descending
+          $target = $sdks[0].Name
+          Write-Host "Using SDK $target"
+          Get-ChildItem -Filter "*.vcxproj" -Recurse | ForEach-Object {
+            (Get-Content $_.FullName) -replace '<WindowsTargetPlatformVersion>[^<]*</WindowsTargetPlatformVersion>', "<WindowsTargetPlatformVersion>$target</WindowsTargetPlatformVersion>" | Set-Content $_.FullName
+          }
+
+      - name: Build (msbuild release x64)
+        shell: cmd
+        working-directory: ${{ env.REPO }}\code\build\${{ env.PROGRAM }}
+        run: msbuild CitizenMP.sln /p:Configuration=Release /p:Platform=x64 /m
+
+      - name: List binaries
+        shell: pwsh
+        working-directory: ${{ env.REPO }}\code\bin\${{ env.PROGRAM }}\Release
+        run: |
+          ls
+          $exes = Get-ChildItem -Filter "*.exe"
+          Write-Host "::notice::Built $($exes.Count) exe files"
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alfamp-engine-${{ github.run_number }}-${{ github.sha }}
+          path: ${{ env.REPO }}\code\bin\${{ env.PROGRAM }}\Release\
+          retention-days: 30
