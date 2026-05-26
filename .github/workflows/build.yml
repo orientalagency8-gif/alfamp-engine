@@ -37,10 +37,12 @@ jobs:
       - uses: microsoft/setup-msbuild@v2
         with: { msbuild-architecture: x64 }
 
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
       - name: Enable Windows developer mode for symlinks
         shell: pwsh
         run: |
-          # Required so git can create real symlinks during checkout
           New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -PropertyType DWord -Force | Out-Null
           git config --global core.symlinks true
 
@@ -50,7 +52,6 @@ jobs:
           set -e
           mkdir -p /c/b
           cd /c/b
-          # Use the ref/sha from the push event so we build exactly what was pushed
           git -c core.symlinks=true clone --branch master \
             https://github.com/${{ github.repository }}.git alfamp-engine
           cd alfamp-engine
@@ -67,13 +68,11 @@ jobs:
           restore-keys: |
             alfamp-engine-
 
-      - name: Fetch LFS via media URL (from upstream — same blobs)
+      - name: Fetch LFS via media URL
         shell: bash
         working-directory: ${{ env.REPO }}
         run: |
           set -e
-          # Re-create the LFS-pointer files using upstream as source of truth
-          # (we deleted them locally to dodge GitHub LFS push rejection)
           declare -A LFS_FILES=(
             ["vendor/libnode/bin/libnode22.dll"]=1
             ["vendor/libnode/bin/libnode22.lib"]=1
@@ -87,9 +86,8 @@ jobs:
           for path in "${!LFS_FILES[@]}"; do
             url="https://media.githubusercontent.com/media/citizenfx/fivem/master/${path}"
             mkdir -p "$(dirname "$path")"
-            curl -fsSL --retry 3 --retry-delay 2 "$url" -o "${path}" && echo "  ok ${path}" || echo "  FAIL ${path}"
+            curl -fsSL --retry 3 "$url" -o "${path}" && echo "  ok ${path}" || echo "  FAIL ${path}"
           done
-          ls -la vendor/libnode/bin/
 
       - name: Strip svadhesive reference
         shell: bash
@@ -97,9 +95,10 @@ jobs:
         run: |
           if [ -f code/components.json ] && grep -q "svadhesive" code/components.json; then
             python3 -c "import json; p='code/components.json'; d=json.load(open(p)); d=[c for c in d if 'svadhesive' not in str(c).lower()]; json.dump(d,open(p,'w'),indent=2)"
-            echo "stripped svadhesive"
-          else
-            echo "no svadhesive ref to strip"
+          fi
+          # Same for data/client/components.json (runtime copy used by AlfaMP.exe)
+          if [ -f data/client/components.json ] && grep -q "svadhesive" data/client/components.json; then
+            python3 -c "import json; p='data/client/components.json'; d=json.load(open(p)); d=[c for c in d if 'svadhesive' not in str(c).lower()]; json.dump(d,open(p,'w'),indent=2)"
           fi
 
       - name: Download Chrome / CEF
@@ -130,23 +129,74 @@ jobs:
             }
           }
 
+      - name: NuGet restore (fixes CitiMono Microsoft.DotNet.GenAPI missing-package error)
+        shell: cmd
+        working-directory: ${{ env.REPO }}\code\build\${{ env.PROGRAM }}
+        run: nuget restore CitizenMP.sln
+
       - name: Build (msbuild release x64)
         shell: cmd
         working-directory: ${{ env.REPO }}\code\build\${{ env.PROGRAM }}
-        run: msbuild CitizenMP.sln /p:Configuration=Release /p:Platform=x64 /m
+        run: msbuild CitizenMP.sln /p:Configuration=Release /p:Platform=x64 /m /restore
 
-      - name: List binaries
+      - name: Pack client (FULL distribution — uses cfxPackClient.psm1)
         shell: pwsh
-        working-directory: ${{ env.REPO }}\code\bin\${{ env.PROGRAM }}\Release
+        working-directory: ${{ env.REPO }}
+        run: |
+          # The official packing script — copies build output + CEF + Mono + citizen/* + data/client/*
+          # into a single output dir that Alfa MP.exe can actually run from.
+          $packRoot = "C:\b\packed-client"
+          New-Item -ItemType Directory -Force $packRoot | Out-Null
+          $env:packRoot = $packRoot
+          $env:projectRoot = "${{ env.REPO }}"
+
+          # Source the pack script + invoke
+          Import-Module ${{ env.REPO }}\code\tools\ci\psm1\cfxPackClient.psm1 -Force
+          try {
+            Invoke-PackClient -ProjectRoot "${{ env.REPO }}" -PackRoot $packRoot -Game ${{ env.PROGRAM }}
+            Write-Host "::notice::pack-client OK"
+          } catch {
+            # Fallback: do a manual copy of everything we know is needed
+            Write-Host "::warning::Invoke-PackClient failed, doing manual copy: $($_.Exception.Message)"
+            # Copy build output (DLLs + exe)
+            Copy-Item -Force -Recurse "${{ env.REPO }}\code\bin\${{ env.PROGRAM }}\Release\*" $packRoot
+            # Copy data/client/* (runtime templates)
+            Copy-Item -Force -Recurse "${{ env.REPO }}\data\client\*" $packRoot
+            # CEF
+            New-Item -ItemType Directory -Force "$packRoot\bin\cef\locales" | Out-Null
+            Copy-Item -Force -Recurse "${{ env.REPO }}\vendor\cef\Release\*.dll" "$packRoot\bin\"
+            Copy-Item -Force -Recurse "${{ env.REPO }}\vendor\cef\Release\*.bin" "$packRoot\bin\"
+            Copy-Item -Force      "${{ env.REPO }}\vendor\cef\Resources\icudtl.dat" "$packRoot\bin\"
+            Copy-Item -Force      "${{ env.REPO }}\vendor\cef\Resources\*.pak"      "$packRoot\bin\cef\"
+            Copy-Item -Force      "${{ env.REPO }}\vendor\cef\Resources\locales\en-US.pak" "$packRoot\bin\cef\locales\"
+          }
+
+          Write-Host "::group::Packed contents"
+          Get-ChildItem $packRoot -File | Select-Object -First 30 | ForEach-Object { Write-Host "  $($_.Name)  $([math]::Round($_.Length/1KB,1)) KB" }
+          Write-Host "::endgroup::"
+          Write-Host "Total packed size:"
+          (Get-ChildItem $packRoot -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB | ForEach-Object { Write-Host "  $([math]::Round($_,1)) MB" }
+
+      - name: Rename FiveM-named files to AlfaMP
+        shell: pwsh
+        run: |
+          $packRoot = "C:\b\packed-client"
+          if (Test-Path "$packRoot\FiveM.exe") { Rename-Item "$packRoot\FiveM.exe" "AlfaMP.exe" }
+          if (Test-Path "$packRoot\FiveM_Diag.exe") { Rename-Item "$packRoot\FiveM_Diag.exe" "AlfaMP_Diag.exe" }
+          "alfamp-engine-v1.0" | Out-File -FilePath "$packRoot\version.txt" -Encoding utf8 -NoNewline
+
+      - name: List final packed binaries
+        shell: pwsh
+        working-directory: C:\b\packed-client
         run: |
           Get-ChildItem -Filter "*.exe" | ForEach-Object { Write-Host "  $($_.Name)  $([math]::Round($_.Length/1MB,1)) MB" }
-          $exes = (Get-ChildItem -Filter "*.exe").Count
-          Write-Host "::notice::Built $exes exe files"
+          $bundle_size_mb = [math]::Round((Get-ChildItem -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+          Write-Host "::notice::Total bundle size: ${bundle_size_mb} MB"
 
-      - name: Upload artifact
+      - name: Upload PACKED artifact (proper full bundle)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: alfamp-engine-${{ github.run_number }}-${{ github.sha }}
-          path: ${{ env.REPO }}\code\bin\${{ env.PROGRAM }}\Release\
+          name: alfamp-engine-packed-${{ github.run_number }}-${{ github.sha }}
+          path: C:\b\packed-client\
           retention-days: 30
