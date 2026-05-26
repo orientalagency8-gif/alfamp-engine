@@ -27,6 +27,10 @@ jobs:
         with: { node-version: "20" }
       - run: npm install -g yarn
 
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+
       - name: Configure MSYS2
         shell: pwsh
         run: |
@@ -46,7 +50,7 @@ jobs:
           New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -PropertyType DWord -Force | Out-Null
           git config --global core.symlinks true
 
-      - name: Clone our engine (with submodules + symlinks)
+      - name: Clone our engine
         shell: bash
         run: |
           set -e
@@ -58,37 +62,25 @@ jobs:
           git submodule update --jobs=4 --init --recursive --depth=1
           du -sh .
 
-      - name: Auto-resolve any remaining merge conflict markers
+      - name: Auto-resolve any leftover merge conflict markers
         shell: bash
         working-directory: ${{ env.REPO }}
         run: |
-          set -e
-          # Belt-and-suspenders: scan whole tree for any leftover conflict markers
-          # from rebrand patch 3-way merge — auto-resolve by keeping THEIRS (rebrand)
-          # over OURS (upstream original). If the previous diagutil.rc fix already
-          # resolved things, this is a no-op.
           python3 <<'PY'
           import re, pathlib
           fixed = 0
           for f in pathlib.Path('.').rglob('*'):
               if not f.is_file(): continue
-              if f.suffix.lower() not in ('.cpp', '.h', '.rc', '.cs', '.lua', '.js', '.ts', '.json', '.xml', '.csproj', '.vcxproj', '.sln', '.txt', '.md'): continue
+              if f.suffix.lower() not in ('.cpp', '.h', '.rc', '.cs', '.lua', '.js', '.ts', '.json', '.xml', '.csproj', '.vcxproj', '.sln'): continue
               try:
                   t = f.read_text(encoding='utf-8', errors='replace')
               except Exception: continue
-              if '<<<<<<<' not in t: continue
-              # Keep theirs (rebrand) section between ======= and >>>>>>>
-              new = re.sub(
-                  r'^<<<<<<<.*?\n.*?^=======\n(.*?)^>>>>>>>.*?\n',
-                  lambda m: m.group(1),
-                  t,
-                  flags=re.DOTALL | re.MULTILINE,
-              )
+              if not re.search(r'^<<<<<<< ', t, re.MULTILINE): continue
+              new = re.sub(r'^<<<<<<<.*?\n.*?^=======\n(.*?)^>>>>>>>.*?\n', lambda m: m.group(1), t, flags=re.DOTALL | re.MULTILINE)
               if new != t:
                   f.write_text(new, encoding='utf-8')
                   fixed += 1
-                  print(f"  fixed {f}")
-          print(f"Total files auto-fixed: {fixed}")
+          print(f"Total auto-fixed: {fixed}")
           PY
 
       - name: Cache build outputs
@@ -97,6 +89,7 @@ jobs:
           path: |
             C:\b\alfamp-engine\code\build
             C:\b\alfamp-engine\vendor
+            ~/.nuget/packages
           key: alfamp-engine-${{ github.sha }}
           restore-keys: |
             alfamp-engine-
@@ -106,17 +99,16 @@ jobs:
         working-directory: ${{ env.REPO }}
         run: |
           set -e
-          declare -A LFS_FILES=(
-            ["vendor/libnode/bin/libnode22.dll"]=1
-            ["vendor/libnode/bin/libnode22.lib"]=1
-            ["vendor/libnode/bin/libnode22.pdb"]=1
-            ["vendor/libnode/bin/libnode22.so"]=1
-            ["vendor/libnode/bin/libuv.dll"]=1
-            ["vendor/libnode/bin/libuv.lib"]=1
-            ["vendor/libnode/bin/libuv.pdb"]=1
-            ["vendor/libnode/bin/libuv.so"]=1
-          )
-          for path in "${!LFS_FILES[@]}"; do
+          for path in \
+            "vendor/libnode/bin/libnode22.dll" \
+            "vendor/libnode/bin/libnode22.lib" \
+            "vendor/libnode/bin/libnode22.pdb" \
+            "vendor/libnode/bin/libnode22.so" \
+            "vendor/libnode/bin/libuv.dll" \
+            "vendor/libnode/bin/libuv.lib" \
+            "vendor/libnode/bin/libuv.pdb" \
+            "vendor/libnode/bin/libuv.so" \
+          ; do
             url="https://media.githubusercontent.com/media/citizenfx/fivem/master/${path}"
             mkdir -p "$(dirname "$path")"
             curl -fsSL --retry 3 "$url" -o "${path}" && echo "  ok ${path}" || echo "  FAIL ${path}"
@@ -129,7 +121,6 @@ jobs:
           for F in code/components.json data/client/components.json data/launcher/components.json; do
             if [ -f "$F" ] && grep -q "svadhesive" "$F"; then
               python3 -c "import json; p='$F'; d=json.load(open(p)); d=[c for c in d if 'svadhesive' not in str(c).lower()]; json.dump(d,open(p,'w'),indent=2)"
-              echo "  stripped svadhesive from $F"
             fi
           done
 
@@ -143,7 +134,7 @@ jobs:
         working-directory: ${{ env.REPO }}
         run: prebuild.cmd
 
-      - name: Generate solution
+      - name: Generate solution (also re-runs premake after our rebrand patches)
         shell: pwsh
         working-directory: ${{ env.REPO }}
         run: pwsh ./fxd.ps1 gen -game ${{ env.PROGRAM }}
@@ -161,29 +152,52 @@ jobs:
             }
           }
 
-      - name: NuGet restore
-        shell: cmd
+      - name: NuGet restore (with our NuGet.config in repo root)
+        shell: pwsh
         working-directory: ${{ env.REPO }}\code\build\${{ env.PROGRAM }}
-        run: nuget restore CitizenMP.sln
+        run: |
+          # Try with the repo-root NuGet.config first (added in v5)
+          if (Test-Path "${{ env.REPO }}\NuGet.config") {
+            Write-Host "Using repo-root NuGet.config"
+            nuget restore CitizenMP.sln -ConfigFile "${{ env.REPO }}\NuGet.config"
+          } else {
+            nuget restore CitizenMP.sln
+          }
 
       - name: Build (msbuild release x64)
         shell: cmd
         working-directory: ${{ env.REPO }}\code\build\${{ env.PROGRAM }}
         run: msbuild CitizenMP.sln /p:Configuration=Release /p:Platform=x64 /m /restore
 
-      - name: Build CFX UI (data.zip + data_big.zip)
+      - name: Build CFX UI via Invoke-BuildUI (proper way per cfxBuildUI.psm1)
         shell: pwsh
-        working-directory: ${{ env.REPO }}\ext\cfx-ui
+        working-directory: ${{ env.REPO }}
         continue-on-error: true
         run: |
-          # CFX UI is Angular. Install deps + build.
-          # If it fails, we'll ship a minimal stub data.zip.
-          if (Test-Path package.json) {
+          # Use the upstream's own UI build module — it handles yarn install + build + zip-pack
+          # via 7z, exactly matching what cfxPackClient.psm1 expects.
+          try {
+            Import-Module .\code\tools\ci\psm1\cfxBuildContext.psm1 -Force
+            Import-Module .\code\tools\ci\psm1\cfxVersions.psm1     -Force
+            Import-Module .\code\tools\ci\psm1\cfxBuildUI.psm1      -Force
+
+            # Construct context the same way build_client.ps1 does
+            $ctx = [CfxBuildContext]::new("${{ env.REPO }}", "${{ env.PROGRAM }}")
+            $versions = [CfxVersions]::new($ctx)
+
+            Invoke-BuildUI -Context $ctx -Versions $versions
+            Write-Host "::notice::Invoke-BuildUI succeeded"
+          } catch {
+            Write-Host "::warning::Invoke-BuildUI failed: $($_.Exception.Message). Falling back to direct yarn build."
+            # Fallback: direct build of cfx-ui
+            Push-Location "${{ env.REPO }}\ext\cfx-ui"
             yarn install --frozen-lockfile --network-timeout 100000
-            yarn build:prod
-            # Move output to ext/ui-build/data.zip
+            yarn build:prod 2>&1
+            Pop-Location
             if (Test-Path "${{ env.REPO }}\ext\ui-build\build.cmd") {
-              & "${{ env.REPO }}\ext\ui-build\build.cmd"
+              Push-Location "${{ env.REPO }}\ext\ui-build"
+              & .\build.cmd 2>&1
+              Pop-Location
             }
           }
 
@@ -191,34 +205,25 @@ jobs:
         shell: pwsh
         working-directory: ${{ env.REPO }}\ext\ui-build
         run: |
-          # Pack-client requires these. If real ones aren't built, create minimal stubs
-          # so pack-client doesn't fail. The launcher's own UI won't show but server
-          # connection still works.
           if (!(Test-Path data.zip)) {
             New-Item -ItemType Directory -Force stub-ui | Out-Null
             "<!DOCTYPE html><html><body><h1>Alfa MP</h1></body></html>" | Out-File -Encoding utf8 stub-ui\index.html
             Compress-Archive -Path stub-ui\* -DestinationPath data.zip -Force
-            Write-Host "::warning::Using STUB data.zip (yarn UI build failed)"
+            Write-Host "::warning::Using STUB data.zip (UI build failed)"
           }
           if (!(Test-Path data_big.zip)) {
             Copy-Item data.zip data_big.zip
-            Write-Host "::warning::Using STUB data_big.zip"
           }
           Get-ChildItem *.zip | Select-Object Name, Length
 
-      - name: Create stub RGL-ElevationHelper.exe (closed-source piece)
+      - name: Create stub RGL-ElevationHelper.exe
         shell: pwsh
         working-directory: ${{ env.REPO }}\code\bin\${{ env.PROGRAM }}\Release
         run: |
-          # RGL-ElevationHelper is from CFX's closed-source package and we don't have it.
-          # Create a no-op stub so pack-client's Copy-Item succeeds. The stub does nothing —
-          # CFX will skip elevation features but the rest of the launcher should still work.
           if (!(Test-Path RGL-ElevationHelper.exe)) {
-            # Use a tiny known-valid PE binary — copy the diag exe and rename
-            if (Test-Path FiveM_Diag.exe)   { Copy-Item FiveM_Diag.exe RGL-ElevationHelper.exe }
-            elseif (Test-Path AlfaMP_Diag.exe) { Copy-Item AlfaMP_Diag.exe RGL-ElevationHelper.exe }
-            elseif (Test-Path FiveM.exe)    { Copy-Item FiveM.exe RGL-ElevationHelper.exe }
-            else { Write-Host "::warning::no exe to copy for RGL-ElevationHelper stub" }
+            if (Test-Path FiveM_Diag.exe)    { Copy-Item FiveM_Diag.exe RGL-ElevationHelper.exe }
+            elseif (Test-Path AlfaMP_Diag.exe){ Copy-Item AlfaMP_Diag.exe RGL-ElevationHelper.exe }
+            elseif (Test-Path FiveM.exe)     { Copy-Item FiveM.exe RGL-ElevationHelper.exe }
           }
 
       - name: Pack client (full distribution)
@@ -240,7 +245,7 @@ jobs:
           Copy-Item -Force          "$proj\vendor\cef\Resources\*.pak"             "$packRoot\bin\cef\"        -ErrorAction SilentlyContinue
           Copy-Item -Force          "$proj\vendor\cef\Resources\locales\en-US.pak" "$packRoot\bin\cef\locales\" -ErrorAction SilentlyContinue
 
-          # data/shared/*, data/client/*, data/redist/crt/* → bin/
+          # data
           Copy-Item -Force -Recurse "$proj\data\shared\*"     "$packRoot\" -ErrorAction SilentlyContinue
           Copy-Item -Force -Recurse "$proj\data\client\*"     "$packRoot\" -ErrorAction SilentlyContinue
           Copy-Item -Force -Recurse "$proj\data\redist\crt\*" "$packRoot\bin\" -ErrorAction SilentlyContinue
@@ -252,11 +257,15 @@ jobs:
           Copy-Item -Force -Recurse "$bin\citizen\*"                   "$packRoot\citizen\" -ErrorAction SilentlyContinue
 
           # Main exe (renamed)
-          if (Test-Path "$bin\FiveM.exe")      { Copy-Item -Force "$bin\FiveM.exe"      "$packRoot\AlfaMP.exe" }
-          if (Test-Path "$bin\AlfaMP.exe")     { Copy-Item -Force "$bin\AlfaMP.exe"     "$packRoot\AlfaMP.exe" }
-          if (Test-Path "$bin\FiveM_Diag.exe") { Copy-Item -Force "$bin\FiveM_Diag.exe" "$packRoot\AlfaMP_Diag.exe" }
-          if (Test-Path "$bin\AlfaMP_Diag.exe"){ Copy-Item -Force "$bin\AlfaMP_Diag.exe" "$packRoot\AlfaMP_Diag.exe" }
-          if (Test-Path "$bin\RGL-ElevationHelper.exe") { Copy-Item -Force "$bin\RGL-ElevationHelper.exe" "$packRoot\" }
+          foreach ($n in @('FiveM.exe','AlfaMP.exe')) {
+            if (Test-Path "$bin\$n") { Copy-Item -Force "$bin\$n" "$packRoot\AlfaMP.exe" }
+          }
+          foreach ($n in @('FiveM_Diag.exe','AlfaMP_Diag.exe')) {
+            if (Test-Path "$bin\$n") { Copy-Item -Force "$bin\$n" "$packRoot\AlfaMP_Diag.exe" }
+          }
+          if (Test-Path "$bin\RGL-ElevationHelper.exe") {
+            Copy-Item -Force "$bin\RGL-ElevationHelper.exe" "$packRoot\"
+          }
 
           # UI assets
           Copy-Item -Force "$proj\ext\ui-build\data.zip"     "$packRoot\citizen\ui.zip"     -ErrorAction SilentlyContinue
@@ -267,30 +276,25 @@ jobs:
           "${{ github.run_number }}"          | Out-File -Encoding ascii "$packRoot\citizen\version.txt"
           "alfamp-engine-v1.0-build${{ github.run_number }}" | Out-File -Encoding ascii "$packRoot\version.txt"
 
-          Write-Host "::group::Packed contents (root)"
-          Get-ChildItem $packRoot -File | Select-Object -First 30 | ForEach-Object { Write-Host "  $($_.Name)" }
+          Write-Host "::group::Packed root files"
+          Get-ChildItem $packRoot -File | ForEach-Object { Write-Host "  $($_.Name)" }
           Write-Host "::endgroup::"
-
           $totalMB = [math]::Round((Get-ChildItem $packRoot -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
-          Write-Host "::notice::Total packed size: ${totalMB} MB"
+          Write-Host "::notice::Packed bundle: ${totalMB} MB"
 
-      - name: Sanity check the packed client
+      - name: Sanity check
         shell: pwsh
         working-directory: C:\b\packed-client
         run: |
           $required = @('AlfaMP.exe', 'components.json', 'bin\libcef.dll', 'citizen\version.txt')
           $missing = @()
-          foreach ($r in $required) {
-            if (!(Test-Path $r)) { $missing += $r }
-          }
+          foreach ($r in $required) { if (!(Test-Path $r)) { $missing += $r } }
           if ($missing.Count -gt 0) {
-            Write-Host "::error::PACKED BUNDLE MISSING REQUIRED FILES: $($missing -join ', ')"
+            Write-Host "::error::PACKED BUNDLE MISSING: $($missing -join ', ')"
             exit 1
           } else {
-            Write-Host "::notice::Bundle sanity check PASSED — all required files present"
+            Write-Host "::notice::All required files present"
           }
-          Write-Host
-          Get-ChildItem -Filter "*.exe" | ForEach-Object { Write-Host "  $($_.Name)  $([math]::Round($_.Length/1MB,1)) MB" }
 
       - name: Upload PACKED artifact
         if: always()
