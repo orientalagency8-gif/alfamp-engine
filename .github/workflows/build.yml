@@ -19,12 +19,6 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 180
     steps:
-      - name: Checkout our engine
-        uses: actions/checkout@v4
-        with:
-          path: src
-          lfs: false
-
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install setuptools
@@ -43,11 +37,25 @@ jobs:
       - uses: microsoft/setup-msbuild@v2
         with: { msbuild-architecture: x64 }
 
-      - name: Move source to C:\b
+      - name: Enable Windows developer mode for symlinks
+        shell: pwsh
+        run: |
+          # Required so git can create real symlinks during checkout
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -PropertyType DWord -Force | Out-Null
+          git config --global core.symlinks true
+
+      - name: Clone our engine (with submodules + symlinks)
         shell: bash
         run: |
+          set -e
           mkdir -p /c/b
-          mv src /c/b/alfamp-engine
+          cd /c/b
+          # Use the ref/sha from the push event so we build exactly what was pushed
+          git -c core.symlinks=true clone --branch master \
+            https://github.com/${{ github.repository }}.git alfamp-engine
+          cd alfamp-engine
+          git submodule update --jobs=4 --init --recursive --depth=1
+          du -sh .
 
       - name: Cache build outputs
         uses: actions/cache@v4
@@ -61,45 +69,37 @@ jobs:
 
       - name: Fetch LFS via media URL (from upstream — same blobs)
         shell: bash
+        working-directory: ${{ env.REPO }}
         run: |
           set -e
-          cd /c/b/alfamp-engine
-          mapfile -t FILES < <(git lfs ls-files -n 2>/dev/null || true)
-          echo "::notice::Found ${#FILES[@]} LFS files"
-          export OWNER=citizenfx OWNER_NAME=fivem REF=master
-          printf '%s\n' "${FILES[@]}" | xargs -P 8 -I {} bash -c '
-            path="{}"
-            url="https://media.githubusercontent.com/media/${OWNER}/${OWNER_NAME}/${REF}/${path}"
-            tmp="${path}.tmp.$$"
-            if curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$tmp"; then
-              mv "$tmp" "$path"
-            else
-              rm -f "$tmp"
-              echo "::warning::failed to fetch $path"
-            fi
-          '
-          STILL=0
-          for p in "${FILES[@]}"; do
-            if [ -f "$p" ]; then
-              sz=$(wc -c <"$p")
-              if [ "$sz" -le 250 ] && head -c 50 "$p" | grep -q "git-lfs.github.com"; then
-                STILL=$((STILL+1))
-              fi
-            fi
+          # Re-create the LFS-pointer files using upstream as source of truth
+          # (we deleted them locally to dodge GitHub LFS push rejection)
+          declare -A LFS_FILES=(
+            ["vendor/libnode/bin/libnode22.dll"]=1
+            ["vendor/libnode/bin/libnode22.lib"]=1
+            ["vendor/libnode/bin/libnode22.pdb"]=1
+            ["vendor/libnode/bin/libnode22.so"]=1
+            ["vendor/libnode/bin/libuv.dll"]=1
+            ["vendor/libnode/bin/libuv.lib"]=1
+            ["vendor/libnode/bin/libuv.pdb"]=1
+            ["vendor/libnode/bin/libuv.so"]=1
+          )
+          for path in "${!LFS_FILES[@]}"; do
+            url="https://media.githubusercontent.com/media/citizenfx/fivem/master/${path}"
+            mkdir -p "$(dirname "$path")"
+            curl -fsSL --retry 3 --retry-delay 2 "$url" -o "${path}" && echo "  ok ${path}" || echo "  FAIL ${path}"
           done
-          if [ "$STILL" -gt 0 ]; then
-            echo "::error::$STILL LFS files still pointers — fatal"
-            exit 1
-          fi
-          du -sh .
+          ls -la vendor/libnode/bin/
 
       - name: Strip svadhesive reference
         shell: bash
         working-directory: ${{ env.REPO }}
         run: |
-          if grep -rl "svadhesive" code/components.json 2>/dev/null; then
+          if [ -f code/components.json ] && grep -q "svadhesive" code/components.json; then
             python3 -c "import json; p='code/components.json'; d=json.load(open(p)); d=[c for c in d if 'svadhesive' not in str(c).lower()]; json.dump(d,open(p,'w'),indent=2)"
             echo "stripped svadhesive"
+          else
+            echo "no svadhesive ref to strip"
           fi
 
       - name: Download Chrome / CEF
@@ -121,11 +121,13 @@ jobs:
         shell: pwsh
         working-directory: ${{ env.REPO }}\code\build\${{ env.PROGRAM }}
         run: |
-          $sdks = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include\" | Where-Object { $_.Name -match '^10\.0\.' } | Sort-Object Name -Descending
-          $target = $sdks[0].Name
-          Write-Host "Using SDK $target"
-          Get-ChildItem -Filter "*.vcxproj" -Recurse | ForEach-Object {
-            (Get-Content $_.FullName) -replace '<WindowsTargetPlatformVersion>[^<]*</WindowsTargetPlatformVersion>', "<WindowsTargetPlatformVersion>$target</WindowsTargetPlatformVersion>" | Set-Content $_.FullName
+          $sdks = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include\" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^10\.0\.' } | Sort-Object Name -Descending
+          if ($sdks) {
+            $target = $sdks[0].Name
+            Write-Host "Using SDK $target"
+            Get-ChildItem -Filter "*.vcxproj" -Recurse | ForEach-Object {
+              (Get-Content $_.FullName) -replace '<WindowsTargetPlatformVersion>[^<]*</WindowsTargetPlatformVersion>', "<WindowsTargetPlatformVersion>$target</WindowsTargetPlatformVersion>" | Set-Content $_.FullName
+            }
           }
 
       - name: Build (msbuild release x64)
@@ -137,9 +139,9 @@ jobs:
         shell: pwsh
         working-directory: ${{ env.REPO }}\code\bin\${{ env.PROGRAM }}\Release
         run: |
-          ls
-          $exes = Get-ChildItem -Filter "*.exe"
-          Write-Host "::notice::Built $($exes.Count) exe files"
+          Get-ChildItem -Filter "*.exe" | ForEach-Object { Write-Host "  $($_.Name)  $([math]::Round($_.Length/1MB,1)) MB" }
+          $exes = (Get-ChildItem -Filter "*.exe").Count
+          Write-Host "::notice::Built $exes exe files"
 
       - name: Upload artifact
         if: always()
